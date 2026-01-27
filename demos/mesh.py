@@ -6,6 +6,7 @@
 
 import io
 import pickle
+import json
 
 import matplotlib.collections as mcoll
 import matplotlib.pyplot as plt
@@ -28,10 +29,12 @@ def plot_mesh_on_image(ava_dir, subject_id, base_dir, camera_id, frame_id, savef
     img_bytes = path.read_bytes()
     image = Image.open(io.BytesIO(img_bytes))
 
-    path = f"{base_dir}/camera_calibration.pkl"
+    path = f"{base_dir}/camera_calibration.json"
+    camera_calibration = load_camera_calibration(path)
 
-    with open(path, "rb") as f:
-        camera_calibration = pickle.load(f)
+    #
+    # with open(path, "rb") as f:
+    #     camera_calibration = pickle.load(f)
 
     print(f"Loaded camera calibration")
 

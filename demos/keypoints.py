@@ -6,12 +6,14 @@
 
 import io
 import pickle
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
 from zipp import Path as ZipPath
 
+from utils import load_camera_calibration
 
 def plot_keypoints_on_image(ava_dir, subject_id, base_dir, camera_id, frame_id, savefig=False, showfig=False):
 
@@ -23,10 +25,13 @@ def plot_keypoints_on_image(ava_dir, subject_id, base_dir, camera_id, frame_id, 
     img_bytes = path.read_bytes()
     image = Image.open(io.BytesIO(img_bytes))
 
-    path = f"{base_dir}/camera_calibration.pkl"
+    path = f"{base_dir}/camera_calibration.json"
 
-    with open(path, "rb") as f:
-        camera_calibration = pickle.load(f)
+    camera_calibration = load_camera_calibration(path)
+    #camera_calibration = json.load(open(path))
+    #
+    # with open(path, "rb") as f:
+    #     camera_calibration = pickle.load(f)
 
     print(f"Loaded camera calibration")
 
