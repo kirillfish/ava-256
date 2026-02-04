@@ -139,18 +139,17 @@ def project_points_3d_to_2d(
     # Apply head pose if provided
     if head_pose is not None:
         # head_pose is 3x4, points_h is (N, 4)
-        points_world = (head_pose @ points_h.T)  # (3, N)
+        points_world = head_pose @ points_h.T  # (3, N)
         # Add homogeneous coordinate for camera projection
+        # points_world = np.vstack([np.ones((1, n_points)), points_world])  # (4, N)
         points_world = np.vstack([points_world, np.ones((1, n_points))])  # (4, N)
     else:
         points_world = points_h.T  # (4, N)
 
     # Project using camera matrices
     twod = intrin @ extrin @ points_world  # (3, N)
-
     # Perspective division
     twod = twod / twod[2:3, :]
-
     # Scale for downsampled images
     twod = twod / image_scale
 
@@ -277,6 +276,270 @@ def project_uv_to_2d(
     return project_points_3d_to_2d(points_3d, camera_params, head_pose, image_scale)
 
 
+def _project_points_3d_to_2d_with_depth(
+    points_3d: np.ndarray,
+    camera_params: Dict[str, np.ndarray],
+    head_pose: Optional[np.ndarray] = None,
+    image_scale: float = 4.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Project 3D points to 2D camera coordinates and return camera-space depth.
+
+    Returns:
+        Tuple:
+            twod: (2, N) projected 2D points
+            depth: (N,) camera-space depth (z)
+            cam_coords: (N, 3) camera-space coordinates
+    """
+    intrin = camera_params["intrin"]
+    extrin = camera_params["extrin"]
+
+    if points_3d.ndim == 1:
+        points_3d = points_3d.reshape(1, -1)
+
+    n_points = points_3d.shape[0]
+    points_h = np.hstack([points_3d, np.ones((n_points, 1))])  # (N, 4)
+
+    if head_pose is not None:
+        points_world = (head_pose @ points_h.T)  # (3, N)
+        points_world = np.vstack([points_world, np.ones((1, n_points))])  # (4, N)
+    else:
+        points_world = points_h.T  # (4, N)
+
+    cam_coords = extrin @ points_world  # (3, N)
+    depth = cam_coords[2].copy()
+
+    twod = intrin @ cam_coords  # (3, N)
+    twod = twod / twod[2:3, :]
+    twod = twod / image_scale
+
+    return twod[:2, :], depth, cam_coords.T
+
+
+def _rasterize_depth_buffer(
+    mesh_v: np.ndarray,
+    mesh_vi: np.ndarray,
+    camera_params: Dict[str, np.ndarray],
+    head_pose: Optional[np.ndarray],
+    output_size: Tuple[int, int],
+    image_scale: float,
+    cull_backfaces: bool,
+) -> np.ndarray:
+    """
+    Rasterize a depth buffer for the full mesh.
+    """
+    h_out, w_out = output_size
+    depth = np.full((h_out, w_out), np.inf, dtype=np.float32)
+
+    points_2d, v_depth, v_cam = _project_points_3d_to_2d_with_depth(
+        mesh_v, camera_params, head_pose, image_scale
+    )
+    xs = points_2d[0]
+    ys = points_2d[1]
+
+    faces = mesh_vi
+    if not isinstance(faces, np.ndarray):
+        faces = np.array(faces, dtype=np.int32)
+
+    for tri in faces:
+        if len(tri) != 3:
+            continue
+        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
+
+        z0, z1, z2 = v_depth[i0], v_depth[i1], v_depth[i2]
+        if z0 <= 0 or z1 <= 0 or z2 <= 0:
+            continue
+
+        if cull_backfaces:
+            v0 = v_cam[i0]
+            v1 = v_cam[i1]
+            v2 = v_cam[i2]
+            normal = np.cross(v1 - v0, v2 - v0)
+            if np.dot(normal, v0) >= 0:
+                continue
+
+        x0, y0 = xs[i0], ys[i0]
+        x1, y1 = xs[i1], ys[i1]
+        x2, y2 = xs[i2], ys[i2]
+
+        minx = int(np.floor(min(x0, x1, x2)))
+        maxx = int(np.ceil(max(x0, x1, x2)))
+        miny = int(np.floor(min(y0, y1, y2)))
+        maxy = int(np.ceil(max(y0, y1, y2)))
+
+        if maxx < 0 or maxy < 0 or minx >= w_out or miny >= h_out:
+            continue
+
+        minx = max(minx, 0)
+        maxx = min(maxx, w_out - 1)
+        miny = max(miny, 0)
+        maxy = min(maxy, h_out - 1)
+
+        den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if den == 0:
+            continue
+
+        xs_grid = np.arange(minx, maxx + 1, dtype=np.float32) + 0.5
+        ys_grid = np.arange(miny, maxy + 1, dtype=np.float32) + 0.5
+        gx, gy = np.meshgrid(xs_grid, ys_grid)
+
+        b0 = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / den
+        b1 = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / den
+        b2 = 1.0 - b0 - b1
+        inside = (b0 >= 0) & (b1 >= 0) & (b2 >= 0)
+        if not np.any(inside):
+            continue
+
+        z_interp = b0 * z0 + b1 * z1 + b2 * z2
+        sub_depth = depth[miny : maxy + 1, minx : maxx + 1]
+        update = inside & (z_interp < sub_depth)
+        sub_depth[update] = z_interp[update]
+
+    return depth
+
+
+def _rasterize_uv_mask(
+    uv_mask: np.ndarray,
+    mesh_v: np.ndarray,
+    mesh_vi: np.ndarray,
+    mesh_vt: np.ndarray,
+    mesh_vti: np.ndarray,
+    camera_params: Dict[str, np.ndarray],
+    head_pose: Optional[np.ndarray],
+    output_size: Tuple[int, int],
+    image_scale: float,
+    cull_backfaces: bool,
+    uv_v_flip: bool,
+    depth_eps: float,
+) -> np.ndarray:
+    """
+    Rasterize a UV-space mask onto the camera image using full mesh z-buffering.
+
+    Returns:
+        np.ndarray: Binary mask of shape output_size
+    """
+    h_uv, w_uv = uv_mask.shape
+    h_out, w_out = output_size
+    depth = np.full((h_out, w_out), np.inf, dtype=np.float32)
+    mask_out = np.zeros((h_out, w_out), dtype=np.uint8)
+
+    points_2d, v_depth, v_cam = _project_points_3d_to_2d_with_depth(
+        mesh_v, camera_params, head_pose, image_scale
+    )
+    xs = points_2d[0]
+    ys = points_2d[1]
+
+    faces = mesh_vi
+    if not isinstance(faces, np.ndarray):
+        faces = np.array(faces, dtype=np.int32)
+    uv_faces = mesh_vti
+    if not isinstance(uv_faces, np.ndarray):
+        uv_faces = np.array(uv_faces, dtype=np.int32)
+
+    for face_idx, tri in enumerate(faces):
+        if len(tri) != 3:
+            continue
+        i0, i1, i2 = int(tri[0]), int(tri[1]), int(tri[2])
+
+        z0, z1, z2 = v_depth[i0], v_depth[i1], v_depth[i2]
+        if z0 <= 0 or z1 <= 0 or z2 <= 0:
+            continue
+
+        if cull_backfaces:
+            v0 = v_cam[i0]
+            v1 = v_cam[i1]
+            v2 = v_cam[i2]
+            normal = np.cross(v1 - v0, v2 - v0)
+            if np.dot(normal, v0) >= 0:
+                continue
+
+        x0, y0 = xs[i0], ys[i0]
+        x1, y1 = xs[i1], ys[i1]
+        x2, y2 = xs[i2], ys[i2]
+
+        minx = int(np.floor(min(x0, x1, x2)))
+        maxx = int(np.ceil(max(x0, x1, x2)))
+        miny = int(np.floor(min(y0, y1, y2)))
+        maxy = int(np.ceil(max(y0, y1, y2)))
+
+        if maxx < 0 or maxy < 0 or minx >= w_out or miny >= h_out:
+            continue
+
+        minx = max(minx, 0)
+        maxx = min(maxx, w_out - 1)
+        miny = max(miny, 0)
+        maxy = min(maxy, h_out - 1)
+
+        den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if den == 0:
+            continue
+
+        xs_grid = np.arange(minx, maxx + 1, dtype=np.float32) + 0.5
+        ys_grid = np.arange(miny, maxy + 1, dtype=np.float32) + 0.5
+        gx, gy = np.meshgrid(xs_grid, ys_grid)
+
+        b0 = ((y1 - y2) * (gx - x2) + (x2 - x1) * (gy - y2)) / den
+        b1 = ((y2 - y0) * (gx - x2) + (x0 - x2) * (gy - y2)) / den
+        b2 = 1.0 - b0 - b1
+        inside = (b0 >= 0) & (b1 >= 0) & (b2 >= 0)
+        if not np.any(inside):
+            continue
+
+        z_interp = b0 * z0 + b1 * z1 + b2 * z2
+        depth_sub = depth[miny : maxy + 1, minx : maxx + 1]
+        update = inside & (z_interp <= (depth_sub + depth_eps))
+        if not np.any(update):
+            continue
+
+        uv_tri = uv_faces[face_idx]
+        if len(uv_tri) != 3:
+            continue
+        t0, t1, t2 = int(uv_tri[0]), int(uv_tri[1]), int(uv_tri[2])
+        uv0 = mesh_vt[t0]
+        uv1 = mesh_vt[t1]
+        uv2 = mesh_vt[t2]
+
+        u = b0 * uv0[0] + b1 * uv1[0] + b2 * uv2[0]
+        v = b0 * uv0[1] + b1 * uv1[1] + b2 * uv2[1]
+        if uv_v_flip:
+            v = 1.0 - v
+
+        u_idx = np.clip((u * w_uv).astype(int), 0, w_uv - 1)
+        v_idx = np.clip((v * h_uv).astype(int), 0, h_uv - 1)
+
+        mask_vals = uv_mask[v_idx, u_idx] > 0
+
+        depth_sub[update] = z_interp[update]
+        mask_sub = mask_out[miny : maxy + 1, minx : maxx + 1]
+        mask_sub[update] = mask_vals[update].astype(np.uint8)
+
+    return mask_out
+
+
+def _resolve_image_scale(
+    image_scale: Optional[float],
+    camera_params: Dict[str, np.ndarray],
+    output_size: Tuple[int, int],
+) -> float:
+    """
+    Resolve image scale from camera params and output size if not provided.
+    """
+    if image_scale is not None:
+        return float(image_scale)
+
+    cam_h = camera_params.get("height")
+    cam_w = camera_params.get("width")
+    if cam_h is None or cam_w is None:
+        return 4.0
+
+    h_out, w_out = output_size
+    scale_h = cam_h / float(h_out)
+    scale_w = cam_w / float(w_out)
+    if abs(scale_h - scale_w) > 1e-3:
+        return float((scale_h + scale_w) / 2.0)
+    return float(scale_h)
+
+
 def project_segmentation_from_uv(
     uv_mask: np.ndarray,
     mesh_v: np.ndarray,
@@ -284,9 +547,15 @@ def project_segmentation_from_uv(
     mesh_vt: np.ndarray,
     mesh_vti: np.ndarray,
     camera_params: Dict[str, np.ndarray],
-    head_pose: np.ndarray,
+    head_pose: Optional[np.ndarray],
     output_size: Tuple[int, int],
-    image_scale: float = 4.0,
+    image_scale: Optional[float] = None,
+    occlusion: bool = False,
+    depth_eps: float = 1e-3,
+    cull_backfaces: bool = True,
+    uv_v_flip: bool = True,
+    depth_sample: str = "center",
+    rasterize_triangles: Optional[bool] = None,
 ) -> np.ndarray:
     """
     Project a UV-space segmentation mask to 2D camera space.
@@ -300,13 +569,37 @@ def project_segmentation_from_uv(
         mesh_vt: Mesh texture coordinates of shape (T, 2)
         mesh_vti: Mesh face texture coordinate indices of shape (F, 3)
         camera_params: Dictionary with 'intrin' and 'extrin' matrices
-        head_pose: 3x4 head pose transformation matrix
+        head_pose: Optional 3x4 head pose transformation matrix
         output_size: (height, width) of output mask
-        image_scale: Scale factor for downsampled images
+        image_scale: Scale factor for downsampled images (auto if None)
+        occlusion: Whether to perform visibility testing against full mesh depth
+        depth_eps: Depth tolerance for visibility test
+        cull_backfaces: Whether to cull back-facing triangles in depth rasterization
+        uv_v_flip: Whether to flip V when converting UV mask pixels to UV coords
+        depth_sample: "center" or "min3x3" for depth comparison
+        rasterize_triangles: Whether to rasterize mesh triangles instead of point splats
 
     Returns:
         np.ndarray: Binary mask of shape output_size
     """
+    resolved_scale = _resolve_image_scale(image_scale, camera_params, output_size)
+    if rasterize_triangles is None:
+        rasterize_triangles = occlusion
+    if rasterize_triangles:
+        return _rasterize_uv_mask(
+            uv_mask,
+            mesh_v,
+            mesh_vi,
+            mesh_vt,
+            mesh_vti,
+            camera_params,
+            head_pose,
+            output_size,
+            resolved_scale,
+            cull_backfaces,
+            uv_v_flip,
+            depth_eps,
+        )
     h_uv, w_uv = uv_mask.shape
     h_out, w_out = output_size
 
@@ -318,26 +611,66 @@ def project_segmentation_from_uv(
 
     # Convert pixel coordinates to UV coordinates [0, 1]
     # UV origin is typically bottom-left in OpenGL convention, but we use top-left
-    uv_coords = np.stack([
-        (u_indices + 0.5) / w_uv,
-        1.0 - (v_indices + 0.5) / h_uv,
-    ], axis=1)
-
-    # Project UV coordinates to 2D
-    points_2d = project_uv_to_2d(
-        uv_coords, mesh_v, mesh_vi, mesh_vt, mesh_vti,
-        camera_params, head_pose, image_scale
+    if uv_v_flip:
+        v_coords = 1.0 - (v_indices + 0.5) / h_uv
+    else:
+        v_coords = (v_indices + 0.5) / h_uv
+    uv_coords = np.stack(
+        [
+            (u_indices + 0.5) / w_uv,
+            v_coords,
+        ],
+        axis=1,
     )
 
+    # Convert UV to 3D and project to 2D (also get depth)
+    points_3d = uv_to_3d(uv_coords, mesh_v, mesh_vi, mesh_vt, mesh_vti)
+    points_2d, points_depth, _ = _project_points_3d_to_2d_with_depth(
+        points_3d, camera_params, head_pose, resolved_scale
+    )
     # Create output mask
     output_mask = np.zeros(output_size, dtype=np.uint8)
 
-    # Rasterize points to output mask
-    x_coords = np.round(points_2d[0]).astype(int)
-    y_coords = np.round(points_2d[1]).astype(int)
-
+    # Rasterize points to output mask (pixel-center convention)
+    x_coords = np.floor(points_2d[0] + 0.5).astype(int)
+    y_coords = np.floor(points_2d[1] + 0.5).astype(int)
     # Filter valid coordinates
-    valid = (x_coords >= 0) & (x_coords < w_out) & (y_coords >= 0) & (y_coords < h_out)
+    valid = (
+        (x_coords >= 0)
+        & (x_coords < w_out)
+        & (y_coords >= 0)
+        & (y_coords < h_out)
+        & (points_depth > 0)
+    )
+
+    if occlusion:
+        depth_buffer = _rasterize_depth_buffer(
+            mesh_v, mesh_vi, camera_params, head_pose, output_size, resolved_scale, cull_backfaces
+        )
+        valid_idx = np.where(valid)[0]
+        if len(valid_idx) > 0:
+            if depth_sample == "min3x3":
+                depth_padded = np.pad(depth_buffer, 1, mode="constant", constant_values=np.inf)
+                ys = y_coords[valid_idx] + 1
+                xs = x_coords[valid_idx] + 1
+                depth_at_pixels = np.minimum.reduce(
+                    [
+                        depth_padded[ys - 1, xs - 1],
+                        depth_padded[ys - 1, xs],
+                        depth_padded[ys - 1, xs + 1],
+                        depth_padded[ys, xs - 1],
+                        depth_padded[ys, xs],
+                        depth_padded[ys, xs + 1],
+                        depth_padded[ys + 1, xs - 1],
+                        depth_padded[ys + 1, xs],
+                        depth_padded[ys + 1, xs + 1],
+                    ]
+                )
+            else:
+                depth_at_pixels = depth_buffer[y_coords[valid_idx], x_coords[valid_idx]]
+            visible = points_depth[valid_idx] <= (depth_at_pixels + depth_eps)
+            valid = np.zeros_like(valid, dtype=bool)
+            valid[valid_idx] = visible
     output_mask[y_coords[valid], x_coords[valid]] = 1
 
     return output_mask
@@ -410,11 +743,11 @@ def visualize_keypoints_on_image(
     fig, ax = plt.subplots(figsize=(image.width / 100, image.height / 100), dpi=100)
     ax.imshow(image)
     ax.scatter(keypoints_2d[0], keypoints_2d[1], c=color, s=size)
-    ax.axis('off')
+    ax.axis("off")
 
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
-    result = Image.frombytes('RGB', canvas.get_width_height(), canvas.tostring_rgb())
+    result = Image.frombytes("RGB", canvas.get_width_height(), canvas.tostring_rgb())
     plt.close(fig)
 
     return result
